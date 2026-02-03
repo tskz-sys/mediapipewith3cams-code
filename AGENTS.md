@@ -37,6 +37,11 @@
 ---
 
 ## 初回セットアップ（全員）
+### clone前チェック（最小）
+- GitHubのリポジトリにアクセスできることを確認
+- 認証手段を用意（SSH鍵 or HTTPSのPersonal Access Token）
+- 必要ツールのインストールを確認（`git` / `gh` / `uv` / `python`）
+
 ### 1) リモート確認
 ```bash
 git remote -v
