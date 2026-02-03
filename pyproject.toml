@@ -1,0 +1,20 @@
+[project]
+name = "mediapipewith3cams-code"
+version = "0.0.0"
+description = "Scripts for 3-cam pose estimation and post-processing."
+requires-python = ">=3.9"
+dependencies = [
+  "matplotlib",
+  "mediapipe",
+  "numpy",
+  "opencv-python",
+  "pandas",
+  "tqdm",
+  "ultralytics",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "ruff",
+]
