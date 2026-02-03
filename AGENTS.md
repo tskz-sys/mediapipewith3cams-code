@@ -83,6 +83,30 @@ git push origin main
 
 ---
 
+## 安全な開発〜PRフロー（衝突を避けるための最小手順）
+目的：他の人の変更とぶつけずに安全にPRまで到達する。
+
+基本：
+- 作業開始前とPR直前の2回、必ず `main` を最新化する
+- 変更は小さく、1PRに集中させる
+- 同じファイルを複数人が触りそうなら事前共有する
+
+手順：
+1. 作業開始前の儀式（Developers手順）
+2. ブランチ作成（例：`feat/<topic>`）
+3. 実装（こまめに `git status --porcelain` で確認）
+4. PR直前に `main` を再同期  
+   ```bash
+   git checkout main
+   git pull --rebase origin main
+   git checkout <your-branch>
+   git rebase main
+   ```
+5. 競合が出たら止まって報告（勝手に解決しない）
+6. push → PR作成
+
+---
+
 ## ブランチ運用
 ### 命名規則
 - `feat/<topic>` 新機能
