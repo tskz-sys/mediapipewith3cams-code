@@ -37,12 +37,31 @@ BALL_MODEL = "yolo11x.pt"     # Ball用
 
 # --- 検出パラメータ ---
 INFERENCE_SIZE = 1920  # 高解像度維持
-CONF_LOW_LIMIT = 0.10  # 足切りライン
+CONF_LOW_LIMIT = 0.03  # 足切りライン (検出漏れ減少のため緩和)
+CONF_BALL_LOW_LIMIT = 0.005  # Ball用 足切りライン (より低信頼を拾う)
 
 CONF_PERSON    = 0.25  # 人採用閾値
-DEFAULT_CONF_BALL = 0.12  # ボール採用閾値のデフォルト
+DEFAULT_CONF_BALL = 0.02  # ボール採用閾値のデフォルト (検出漏れ減少のため緩和)
 
 MAX_PEOPLE     = 2     # 最大人数
+
+# --- ボール検出パラメータ ---
+BALL_MAX_CANDIDATES = 60   # 候補数を増やして真の候補を拾う (旧: 3)
+BALL_REPROJ_THR = 50.0     # 再投影誤差閾値を緩和 (旧: 12.0)
+BALL_REPROJ_THR_LOOSE = 120.0  # さらに緩い閾値 (fallback用)
+BALL_MAX_JUMP_M = 6.0      # 連続フレームの最大ジャンプ距離 (m)
+BALL_MAX_JUMP_M_LOOSE = 12.0  # fallback用ジャンプ距離 (m)
+BALL_CONF_WEIGHT = 5.0     # 検出信頼度の重み (高信頼度ほどスコア低=良)
+BALL_THIRD_CAM_WEIGHT = 0.1  # 第3視点再投影誤差の重み
+
+# --- ボールゲーティング(2D) ---
+BALL_GATE_ENABLE = True
+BALL_GATE_EXPAND = 2.0
+BALL_GATE_CAM3_RIGHT_CUT = 1.0
+BALL_GATE_MAX_JUMP_PX = 800.0
+BALL_GATE_OUTSIDE_FOCUS_PX = 500.0
+BALL_RESET_FRAMES = 30
+BALL_FILL_MAX_GAP = 30
 
 # MediaPipe設定
 MP_COMPLEXITY = 1
@@ -236,8 +255,12 @@ def str2bool(value):
 class BallSelectorConfig:
     pair_select: bool
     reproj_thr: float
+    reproj_thr_loose: float
     max_jump_m: float
+    max_jump_m_loose: float
     jump_lambda: float
+    conf_weight: float = 0.0       # 検出信頼度の重み (高いほど高信頼度を優遇)
+    third_cam_weight: float = 0.0  # 第3視点再投影誤差の重み
 
 def triangulate_dlt_pair(Pa, ua, Pb, ub):
     return triangulate_DLT([Pa, Pb], [ua, ub])
@@ -261,16 +284,31 @@ def reproj_error_px(P, K, X, target_norm):
     target_px = norm_to_pixel(K, target_norm)
     return float(np.linalg.norm(proj_px - target_px))
 
-def choose_best_ball_pair(ball_lists, Ps, Ks, prev_ball_3d, config):
-    # Pair selection with reprojection error (px) + optional jump penalty.
+def choose_best_ball_pair(ball_lists, Ps, Ks, prev_ball_3d, config, use_loose=False):
+    """Pair selection with improved scoring.
+
+    New scoring formula:
+        score = reproj_err
+              + (jump_lambda * jump_dist)
+              - (conf_weight * avg_conf)           # 高信頼度ほどスコア低=良
+              + (third_cam_weight * third_err)     # 第3視点整合
+    """
     best_candidate = None
     best_score = float("inf")
     reject_reason = "no_valid_pair"
     combos = [(0, 1), (0, 2), (1, 2)]
+    cam_indices = {0, 1, 2}
+
+    reproj_thr = config.reproj_thr_loose if use_loose else config.reproj_thr
+    max_jump_m = config.max_jump_m_loose if use_loose else config.max_jump_m
 
     for cam_a, cam_b in combos:
         if not ball_lists[cam_a] or not ball_lists[cam_b]:
             continue
+
+        # 第3カメラを特定
+        third_cam = next(iter(cam_indices.difference({cam_a, cam_b})))
+
         for cand_a in ball_lists[cam_a]:
             for cand_b in ball_lists[cam_b]:
                 X, _ = triangulate_dlt_pair(Ps[cam_a], cand_a["center_norm"],
@@ -282,16 +320,39 @@ def choose_best_ball_pair(ball_lists, Ps, Ks, prev_ball_3d, config):
                 if not np.isfinite(err_a) or not np.isfinite(err_b):
                     continue
                 reproj_err = 0.5 * (err_a + err_b)
-                if reproj_err > config.reproj_thr:
+                if reproj_err > reproj_thr:
                     reject_reason = f"reproj_above_thr_{cam_a+1}{cam_b+1}"
                     continue
+
+                # ジャンプ距離チェック
                 jump_dist = 0.0
                 if prev_ball_3d is not None:
                     jump_dist = float(np.linalg.norm(X - prev_ball_3d))
-                    if jump_dist > config.max_jump_m:
+                    if jump_dist > max_jump_m:
                         reject_reason = f"jump_too_large_{cam_a+1}{cam_b+1}"
                         continue
-                total_score = reproj_err + (config.jump_lambda * jump_dist)
+
+                # 検出信頼度の平均を計算
+                avg_conf = 0.5 * (float(cand_a["conf"]) + float(cand_b["conf"]))
+
+                # 第3視点の再投影誤差を計算 (ループ内で評価)
+                third_err = None
+                if ball_lists[third_cam]:
+                    third_errs = []
+                    for cand_c in ball_lists[third_cam]:
+                        err_c = reproj_error_px(Ps[third_cam], Ks[third_cam], X, cand_c["center_norm"])
+                        if np.isfinite(err_c):
+                            third_errs.append(err_c)
+                    if third_errs:
+                        third_err = float(min(third_errs))
+
+                # 新スコアリング式
+                total_score = reproj_err
+                total_score += config.jump_lambda * jump_dist
+                total_score -= config.conf_weight * avg_conf  # 高信頼度ほどスコア低=良
+                if third_err is not None and config.third_cam_weight > 0:
+                    total_score += config.third_cam_weight * third_err  # 第3視点整合
+
                 if total_score < best_score:
                     best_score = total_score
                     best_candidate = {
@@ -302,27 +363,15 @@ def choose_best_ball_pair(ball_lists, Ps, Ks, prev_ball_3d, config):
                         "jump_dist": jump_dist,
                         "cand_a": cand_a,
                         "cand_b": cand_b,
+                        "avg_conf": avg_conf,
+                        "third_cam": third_cam,
+                        "third_reproj_err": third_err,
                     }
                     reject_reason = "ok"
 
     if not best_candidate:
         return None, reject_reason, None
 
-    cam_indices = {0, 1, 2}
-    used = set(best_candidate["pair"])
-    third_cam = next(iter(cam_indices.difference(used)))
-    third_err = None
-    if ball_lists[third_cam]:
-        third_errs = []
-        for cand in ball_lists[third_cam]:
-            err = reproj_error_px(Ps[third_cam], Ks[third_cam], best_candidate["X"], cand["center_norm"])
-            if np.isfinite(err):
-                third_errs.append(err)
-        if third_errs:
-            third_err = float(min(third_errs))
-
-    best_candidate["third_cam"] = third_cam
-    best_candidate["third_reproj_err"] = third_err
     return best_candidate, reject_reason, best_score
 # ==========================================
 # 検出ロジック (パディング追加版)
@@ -435,28 +484,160 @@ def process_person_yolo(img, pose_model, mp_model, K, D, max_p, conf_low_limit):
             p_count += 1
     return people
 
-def detect_ball_yolo(img, det_model, K, D, conf_ball, conf_low_limit, max_candidates=3):
+def detect_ball_yolo(img, det_model, K, D, conf_ball, conf_low_limit, max_candidates=3, allow_low_conf_fallback=True):
     res = det_model.predict(img, conf=conf_low_limit, imgsz=INFERENCE_SIZE, verbose=False, classes=[32])[0]
     balls = []
-    if res.boxes is None or len(res.boxes) == 0: return []
+    if res.boxes is None or len(res.boxes) == 0:
+        return []
 
     indices = np.argsort(-res.boxes.conf.cpu().numpy())
     for idx in indices:
-        conf = res.boxes.conf[idx].cpu().numpy()
-        if conf > conf_ball:
-            box = res.boxes.xyxy[idx].cpu().numpy()
-            cx, cy = (box[0]+box[2])/2, (box[1]+box[3])/2
-            norm_pt = undistort_points([(cx, cy)], K, D)[0]
-            balls.append({
-                "center_raw": np.array([cx, cy]),
-                "center_norm": norm_pt,
-                "box": box,
-                "type": "ball",
-                "conf": conf
-            })
-            if len(balls) >= max_candidates:
-                break
+        conf = float(res.boxes.conf[idx].cpu().numpy())
+        if conf < conf_ball and not allow_low_conf_fallback:
+            continue
+
+        box = res.boxes.xyxy[idx].cpu().numpy()
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        norm_pt = undistort_points([(cx, cy)], K, D)[0]
+        balls.append({
+            "center_raw": np.array([cx, cy]),
+            "center_norm": norm_pt,
+            "box": box,
+            "type": "ball",
+            "conf": conf
+        })
+        if len(balls) >= max_candidates:
+            break
     return balls
+
+
+def _people_union_bbox(people):
+    """Return union bbox (x1,y1,x2,y2) of people list. None if empty."""
+    if not people:
+        return None
+    xs1, ys1, xs2, ys2 = [], [], [], []
+    for p in people:
+        if "box" not in p:
+            continue
+        x1, y1, x2, y2 = map(float, p["box"])
+        xs1.append(x1); ys1.append(y1); xs2.append(x2); ys2.append(y2)
+    if not xs1:
+        return None
+    return (min(xs1), min(ys1), max(xs2), max(ys2))
+
+
+def _expand_bbox(b, expand, W, H):
+    """Expand bbox by (expand * w, expand * h) on each side and clamp."""
+    x1, y1, x2, y2 = b
+    w = max(1.0, x2 - x1)
+    h = max(1.0, y2 - y1)
+    x1e = max(0.0, x1 - w * expand)
+    y1e = max(0.0, y1 - h * expand)
+    x2e = min(float(W - 1), x2 + w * expand)
+    y2e = min(float(H - 1), y2 + h * expand)
+    return (x1e, y1e, x2e, y2e)
+
+
+def _point_bbox_distance(px, py, b):
+    """Euclidean distance from point to bbox (0 if inside)."""
+    x1, y1, x2, y2 = b
+    dx = 0.0
+    if px < x1:
+        dx = x1 - px
+    elif px > x2:
+        dx = px - x2
+    dy = 0.0
+    if py < y1:
+        dy = y1 - py
+    elif py > y2:
+        dy = py - y2
+    return float(np.hypot(dx, dy))
+
+
+def select_ball_candidate(
+    balls,
+    people,
+    prev_center_raw,
+    frame_shape,
+    cam_idx,
+    expand,
+    cam3_right_cut,
+    max_jump_px,
+    outside_focus_px,
+    soft_fallback=True,
+):
+    """Pick 0..1 ball candidate per camera to reduce static false positives."""
+    if not balls:
+        return []
+
+    H, W = int(frame_shape[0]), int(frame_shape[1])
+
+    # cam3 right-cut (optional)
+    if 0.0 < cam3_right_cut < 1.0 and cam_idx == 2:
+        x_max = float(W) * float(cam3_right_cut)
+        balls = [b for b in balls if float(0.5 * (b["box"][0] + b["box"][2])) <= x_max]
+        if not balls:
+            return []
+
+    # focus region from people union bbox (expanded)
+    focus = _people_union_bbox(people)
+    if focus is not None and expand is not None and expand > 0:
+        focus = _expand_bbox(focus, float(expand), W, H)
+
+    hard_focus = (focus is not None) and (outside_focus_px is not None) and (outside_focus_px > 0)
+
+    best = None
+    best_score = -1e18
+    for b in balls:
+        conf = float(b.get("conf", 0.0))
+        cx = float(b["center_raw"][0])
+        cy = float(b["center_raw"][1])
+
+        # HARD REJECT: outside focus
+        d_focus = None
+        if hard_focus:
+            d_focus = _point_bbox_distance(cx, cy, focus)
+            if d_focus > float(outside_focus_px):
+                continue
+
+        score = conf
+
+        if prev_center_raw is not None and np.all(np.isfinite(prev_center_raw)):
+            d_prev = float(np.hypot(cx - float(prev_center_raw[0]), cy - float(prev_center_raw[1])))
+            score -= 0.003 * d_prev
+
+        # small preference: closer to focus is better (tie-break)
+        if focus is not None:
+            if d_focus is None:
+                d_focus = _point_bbox_distance(cx, cy, focus)
+            score -= 0.001 * float(d_focus)
+
+        if score > best_score:
+            best_score = score
+            best = b
+
+    if best is None:
+        if soft_fallback:
+            best = max(balls, key=lambda x: float(x.get("conf", 0.0)))
+        else:
+            return []
+
+    cx = float(best["center_raw"][0])
+    cy = float(best["center_raw"][1])
+
+    if prev_center_raw is not None and np.all(np.isfinite(prev_center_raw)):
+        d = float(np.hypot(cx - float(prev_center_raw[0]), cy - float(prev_center_raw[1])))
+        if max_jump_px is not None and max_jump_px > 0 and d > float(max_jump_px):
+            return []
+
+    if hard_focus:
+        d_focus = _point_bbox_distance(cx, cy, focus)
+        if d_focus > float(outside_focus_px):
+            if soft_fallback:
+                return [best]
+            return []
+
+    return [best]
 
 # ==========================================
 # マッチング & 3D化
@@ -563,13 +744,25 @@ def parse_args():
     parser.add_argument("--out_csv", default=OUT_CSV, help="Output CSV path")
     parser.add_argument("--out_video", default=OUT_VIDEO, help="Output video path")
     parser.add_argument("--ball_pair_select", type=str2bool, default=True, help="Enable pair selection gating")
-    parser.add_argument("--ball_reproj_thr", type=float, default=12.0, help="Reprojection error threshold in undistorted pixels")
-    parser.add_argument("--ball_max_jump_m", type=float, default=2.0, help="Max allowed jump distance for sequential frames")
+    parser.add_argument("--ball_reproj_thr", type=float, default=BALL_REPROJ_THR, help="Reprojection error threshold in undistorted pixels")
+    parser.add_argument("--ball_reproj_thr_loose", type=float, default=BALL_REPROJ_THR_LOOSE, help="Loose reprojection error threshold")
+    parser.add_argument("--ball_max_jump_m", type=float, default=BALL_MAX_JUMP_M, help="Max allowed jump distance for sequential frames")
+    parser.add_argument("--ball_max_jump_m_loose", type=float, default=BALL_MAX_JUMP_M_LOOSE, help="Loose max jump distance for sequential frames")
     parser.add_argument("--ball_jump_lambda", type=float, default=0.0, help="Distance penalty weight when selecting best pair")
     parser.add_argument("--ball_verbose", action="store_true", help="Print ball debug info at 1s intervals or rejection")
-    parser.add_argument("--ball_max_candidates", type=int, default=3, help="Max ball detections to keep per camera")
+    parser.add_argument("--ball_max_candidates", type=int, default=BALL_MAX_CANDIDATES, help="Max ball detections to keep per camera")
+    parser.add_argument("--ball_conf_weight", type=float, default=BALL_CONF_WEIGHT, help="Weight for detection confidence in scoring (higher favors confident detections)")
+    parser.add_argument("--ball_third_cam_weight", type=float, default=BALL_THIRD_CAM_WEIGHT, help="Weight for third camera reprojection error in scoring")
     parser.add_argument("--conf_ball", type=float, default=DEFAULT_CONF_BALL, help="Minimum confidence to consider a ball detection")
+    parser.add_argument("--conf_ball_low_limit", type=float, default=CONF_BALL_LOW_LIMIT, help="Low confidence cutoff for ball YOLO inference")
     parser.add_argument("--conf_low_limit", type=float, default=CONF_LOW_LIMIT, help="Low confidence cutoff for YOLO inference")
+    parser.add_argument("--ball_gate_disable", action="store_true", help="Disable per-camera ball gating")
+    parser.add_argument("--ball_gate_expand", type=float, default=BALL_GATE_EXPAND, help="Expand ratio for people-union bbox when gating balls")
+    parser.add_argument("--ball_gate_cam3_right_cut", type=float, default=BALL_GATE_CAM3_RIGHT_CUT, help="Cam3: drop balls with cx > W*cut (0-1). Set 1.0 to disable")
+    parser.add_argument("--ball_gate_max_jump_px", type=float, default=BALL_GATE_MAX_JUMP_PX, help="Reject ball 2D jumps larger than this (px/frame)")
+    parser.add_argument("--ball_gate_outside_focus_px", type=float, default=BALL_GATE_OUTSIDE_FOCUS_PX, help="Drop balls far outside focus bbox (px)")
+    parser.add_argument("--ball_reset_frames", type=int, default=BALL_RESET_FRAMES, help="Reset ball tracking after this many misses")
+    parser.add_argument("--ball_fill_max_gap", type=int, default=BALL_FILL_MAX_GAP, help="Carry forward last ball for up to this many missing frames")
     return parser.parse_args()
 
 
@@ -614,11 +807,17 @@ def main():
 
     prev_centers = {}
     prev_ball_3d = None
+    prev_ball_center_raw = [None, None, None]
+    ball_miss_streak = 0
     ball_config = BallSelectorConfig(
         pair_select=args.ball_pair_select,
         reproj_thr=args.ball_reproj_thr,
+        reproj_thr_loose=args.ball_reproj_thr_loose,
         max_jump_m=args.ball_max_jump_m,
-        jump_lambda=args.ball_jump_lambda
+        max_jump_m_loose=args.ball_max_jump_m_loose,
+        jump_lambda=args.ball_jump_lambda,
+        conf_weight=args.ball_conf_weight,
+        third_cam_weight=args.ball_third_cam_weight,
     )
     log_interval = max(1, int(round(fps))) if fps > 0 else 1
 
@@ -629,12 +828,38 @@ def main():
 
         ppl_lists = []
         ball_lists = []
-        
+
         for cam_i, f in enumerate(frames):
             K, D, _ = cam_params_full[cam_i]
             p = process_person_yolo(f, yolo_pose, pose_estimator, K, D, MAX_PEOPLE, args.conf_low_limit)
             ppl_lists.append(p)
-            b = detect_ball_yolo(f, yolo_det, K, D, args.conf_ball, args.conf_low_limit, args.ball_max_candidates)
+            b_all = detect_ball_yolo(
+                f, yolo_det, K, D,
+                args.conf_ball,
+                args.conf_ball_low_limit,
+                args.ball_max_candidates,
+                allow_low_conf_fallback=True,
+            )
+
+            if not args.ball_gate_disable:
+                b_sel = select_ball_candidate(
+                    b_all,
+                    p,
+                    prev_ball_center_raw[cam_i],
+                    f.shape,
+                    cam_i,
+                    args.ball_gate_expand,
+                    args.ball_gate_cam3_right_cut,
+                    args.ball_gate_max_jump_px,
+                    args.ball_gate_outside_focus_px,
+                    soft_fallback=True,
+                )
+                if b_sel:
+                    prev_ball_center_raw[cam_i] = b_sel[0]["center_raw"]
+                b = b_sel
+            else:
+                b = b_all
+
             ball_lists.append(b)
 
             if DRAW_DEBUG_BBOX:
@@ -780,12 +1005,19 @@ def main():
         best_ball = None
         ball_reason = "no_pair"
         if args.ball_pair_select:
-            best_ball, ball_reason, _ = choose_best_ball_pair(ball_lists, Ps, Ks, prev_ball_3d, ball_config)
+            best_ball, ball_reason, _ = choose_best_ball_pair(ball_lists, Ps, Ks, prev_ball_3d, ball_config, use_loose=False)
+            if not best_ball:
+                best_ball, loose_reason, _ = choose_best_ball_pair(ball_lists, Ps, Ks, prev_ball_3d, ball_config, use_loose=True)
+                if best_ball:
+                    ball_reason = f"loose_{loose_reason}"
             if best_ball:
                 prev_ball_3d = best_ball["X"]
+                ball_miss_streak = 0
                 a_cam, b_cam = best_ball["pair"]
                 ball_centers_for_draw[a_cam] = best_ball["cand_a"]["box"]
                 ball_centers_for_draw[b_cam] = best_ball["cand_b"]["box"]
+            else:
+                ball_miss_streak += 1
         else:
             valid_ball_pts = []
             valid_ball_Ps = []
@@ -805,8 +1037,27 @@ def main():
                         "jump_dist": 0.0
                     }
                     prev_ball_3d = X_b
+                    ball_miss_streak = 0
                 else:
                     ball_reason = "legacy_reproj"
+            if best_ball is None:
+                ball_miss_streak += 1
+
+        # Fill missing frames by carrying the last known ball position (limited gap)
+        if best_ball is None and prev_ball_3d is not None:
+            if args.ball_fill_max_gap is not None and ball_miss_streak <= int(args.ball_fill_max_gap):
+                best_ball = {
+                    "X": prev_ball_3d,
+                    "pair_label": "carry",
+                    "reproj_err": float("nan"),
+                    "jump_dist": 0.0,
+                }
+                ball_reason = "carry"
+
+        if best_ball is None and ball_miss_streak >= max(1, int(args.ball_reset_frames)):
+            prev_ball_3d = None
+            prev_ball_center_raw = [None, None, None]
+            ball_miss_streak = 0
 
         should_log = args.ball_verbose or (i % log_interval == 0) or (best_ball is None) or (ball_reason not in ("ok", "legacy"))
         if should_log:

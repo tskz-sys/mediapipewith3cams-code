@@ -47,6 +47,7 @@ def normalize_wsl_path(p: str) -> str:
     if not p:
         return p
     p2 = p.replace('\\\\', '/')
+    p2 = p2.replace('\\', '/')
     lower = p2.lower()
     if lower.startswith('//wsl.localhost/ubuntu/'):
         rest = p2[len('//wsl.localhost/Ubuntu/'):]
@@ -54,6 +55,19 @@ def normalize_wsl_path(p: str) -> str:
     if lower.startswith('/wsl.localhost/ubuntu/'):
         rest = p2[len('/wsl.localhost/Ubuntu/'):]
         return '/' + rest.lstrip('/')
+    # Windows drive path (e.g., C:/Users/...)
+    m = re.match(r'^([a-zA-Z]):/(.*)$', p2)
+    if m:
+        drive = m.group(1).lower()
+        rest = m.group(2)
+        cand = f"/mnt/{drive}/{rest}"
+        if Path(cand).exists():
+            return cand
+        # Fallback: try basename in CWD (useful for local copies)
+        base = Path(rest).name
+        if base and Path(base).exists():
+            return str(Path(base).resolve())
+        return cand
     return p2
 
 
@@ -127,7 +141,33 @@ def load_hybrid_module(hybrid_script: str):
     return mod
 
 
-def run_hybrid_one(mod, video1: str, video2: str, video3: str, npz: str, out_csv: str, out_video: str) -> None:
+def run_hybrid_one(
+    mod,
+    video1: str,
+    video2: str,
+    video3: str,
+    npz: str,
+    out_csv: str,
+    out_video: str,
+    conf_low_limit: float = 0.03,
+    conf_ball_low_limit: float = 0.005,
+    conf_ball: float = 0.02,
+    ball_max_candidates: int = 60,
+    ball_reproj_thr: float = 50.0,
+    ball_reproj_thr_loose: float = 120.0,
+    ball_max_jump_m: float = 6.0,
+    ball_max_jump_m_loose: float = 12.0,
+    ball_conf_weight: float = 5.0,
+    ball_third_cam_weight: float = 0.1,
+    ball_gate_enable: bool = True,
+    ball_gate_expand: float = 2.0,
+    ball_gate_cam3_right_cut: float = 1.0,
+    ball_gate_max_jump_px: float = 800.0,
+    ball_gate_outside_focus_px: float = 500.0,
+    ball_reset_frames: int = 30,
+    ball_fill_max_gap: int = 30,
+    ball_verbose: bool = False,
+) -> None:
     """Run hybrid main() by overwriting globals."""
     mod.VIDEO_LEFT = normalize_wsl_path(video1)
     mod.VIDEO_CENTER = normalize_wsl_path(video2)
@@ -136,11 +176,61 @@ def run_hybrid_one(mod, video1: str, video2: str, video3: str, npz: str, out_csv
     mod.OUT_CSV = normalize_wsl_path(out_csv)
     mod.OUT_VIDEO = normalize_wsl_path(out_video)
 
+    # Override ball detection globals
+    mod.CONF_LOW_LIMIT = conf_low_limit
+    mod.CONF_BALL_LOW_LIMIT = conf_ball_low_limit
+    mod.DEFAULT_CONF_BALL = conf_ball
+    mod.BALL_MAX_CANDIDATES = ball_max_candidates
+    mod.BALL_REPROJ_THR = ball_reproj_thr
+    mod.BALL_REPROJ_THR_LOOSE = ball_reproj_thr_loose
+    mod.BALL_MAX_JUMP_M = ball_max_jump_m
+    mod.BALL_MAX_JUMP_M_LOOSE = ball_max_jump_m_loose
+    mod.BALL_CONF_WEIGHT = ball_conf_weight
+    mod.BALL_THIRD_CAM_WEIGHT = ball_third_cam_weight
+    mod.BALL_GATE_ENABLE = ball_gate_enable
+    mod.BALL_GATE_EXPAND = ball_gate_expand
+    mod.BALL_GATE_CAM3_RIGHT_CUT = ball_gate_cam3_right_cut
+    mod.BALL_GATE_MAX_JUMP_PX = ball_gate_max_jump_px
+    mod.BALL_GATE_OUTSIDE_FOCUS_PX = ball_gate_outside_focus_px
+    mod.BALL_RESET_FRAMES = ball_reset_frames
+    mod.BALL_FILL_MAX_GAP = ball_fill_max_gap
+
     # Ensure output directories exist (hybrid will fail otherwise)
     ensure_dir(str(Path(mod.OUT_CSV).parent))
     ensure_dir(str(Path(mod.OUT_VIDEO).parent))
 
-    mod.main()
+    # Build synthetic argv for hybrid's argparser
+    # (hybrid main() calls parse_args() which reads sys.argv)
+    synth_argv = [
+        'hybrid_dual_final_patched.py',
+        '--ball_reproj_thr', str(ball_reproj_thr),
+        '--ball_reproj_thr_loose', str(ball_reproj_thr_loose),
+        '--ball_max_candidates', str(ball_max_candidates),
+        '--ball_max_jump_m', str(ball_max_jump_m),
+        '--ball_max_jump_m_loose', str(ball_max_jump_m_loose),
+        '--ball_conf_weight', str(ball_conf_weight),
+        '--ball_third_cam_weight', str(ball_third_cam_weight),
+        '--conf_ball', str(conf_ball),
+        '--conf_ball_low_limit', str(conf_ball_low_limit),
+        '--conf_low_limit', str(conf_low_limit),
+        '--ball_gate_expand', str(ball_gate_expand),
+        '--ball_gate_cam3_right_cut', str(ball_gate_cam3_right_cut),
+        '--ball_gate_max_jump_px', str(ball_gate_max_jump_px),
+        '--ball_gate_outside_focus_px', str(ball_gate_outside_focus_px),
+        '--ball_reset_frames', str(ball_reset_frames),
+        '--ball_fill_max_gap', str(ball_fill_max_gap),
+    ]
+    if not ball_gate_enable:
+        synth_argv.append('--ball_gate_disable')
+    if ball_verbose:
+        synth_argv.append('--ball_verbose')
+
+    orig_argv = sys.argv
+    try:
+        sys.argv = synth_argv
+        mod.main()
+    finally:
+        sys.argv = orig_argv
 
 
 def split_ball_rows(raw_csv: str, people_csv: str, ball_csv: str) -> None:
@@ -217,6 +307,26 @@ def pipeline_one(
     max_gap: int,
     compare_3d: bool,
     log_path: str,
+    raw_only: bool = False,
+    # Ball detection parameters
+    conf_low_limit: float = 0.03,
+    conf_ball_low_limit: float = 0.005,
+    conf_ball: float = 0.02,
+    ball_max_candidates: int = 60,
+    ball_reproj_thr: float = 50.0,
+    ball_reproj_thr_loose: float = 120.0,
+    ball_max_jump_m: float = 6.0,
+    ball_max_jump_m_loose: float = 12.0,
+    ball_conf_weight: float = 5.0,
+    ball_third_cam_weight: float = 0.1,
+    ball_gate_enable: bool = True,
+    ball_gate_expand: float = 2.0,
+    ball_gate_cam3_right_cut: float = 1.0,
+    ball_gate_max_jump_px: float = 800.0,
+    ball_gate_outside_focus_px: float = 500.0,
+    ball_reset_frames: int = 30,
+    ball_fill_max_gap: int = 30,
+    ball_verbose: bool = False,
 ) -> None:
     out_dir = normalize_wsl_path(out_dir)
     ensure_dir(out_dir)
@@ -237,8 +347,43 @@ def pipeline_one(
     with open(log_path, 'a', encoding='utf-8') as f:
         f.write(f"=== [HYBRID] {stem} ===\n")
         f.write(f"video1={video1}\nvideo2={video2}\nvideo3={video3}\nnpz={calib_npz}\n")
+        f.write(f"raw_only={raw_only}\n")
+        f.write(
+            f"ball params: conf_low={conf_low_limit}, conf_ball_low={conf_ball_low_limit}, "
+            f"conf_ball={conf_ball}, max_cand={ball_max_candidates}, "
+            f"reproj_thr={ball_reproj_thr}/{ball_reproj_thr_loose}, "
+            f"jump_m={ball_max_jump_m}/{ball_max_jump_m_loose}, "
+            f"conf_w={ball_conf_weight}, third_w={ball_third_cam_weight}, "
+            f"gate={ball_gate_enable}, reset_frames={ball_reset_frames}, fill_gap={ball_fill_max_gap}\n"
+        )
 
-    run_hybrid_one(hybrid_mod, video1, video2, video3, calib_npz, raw_csv, det_video)
+    run_hybrid_one(
+        hybrid_mod, video1, video2, video3, calib_npz, raw_csv, det_video,
+        conf_low_limit=conf_low_limit,
+        conf_ball_low_limit=conf_ball_low_limit,
+        conf_ball=conf_ball,
+        ball_max_candidates=ball_max_candidates,
+        ball_reproj_thr=ball_reproj_thr,
+        ball_reproj_thr_loose=ball_reproj_thr_loose,
+        ball_max_jump_m=ball_max_jump_m,
+        ball_max_jump_m_loose=ball_max_jump_m_loose,
+        ball_conf_weight=ball_conf_weight,
+        ball_third_cam_weight=ball_third_cam_weight,
+        ball_gate_enable=ball_gate_enable,
+        ball_gate_expand=ball_gate_expand,
+        ball_gate_cam3_right_cut=ball_gate_cam3_right_cut,
+        ball_gate_max_jump_px=ball_gate_max_jump_px,
+        ball_gate_outside_focus_px=ball_gate_outside_focus_px,
+        ball_reset_frames=ball_reset_frames,
+        ball_fill_max_gap=ball_fill_max_gap,
+        ball_verbose=ball_verbose,
+    )
+
+    # If raw_only, skip all postprocessing
+    if raw_only:
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(f"\n=== [RAW_ONLY] Skipping fix/smooth/merge ===\n")
+        return
 
     # Step 2: split ball vs people
     split_ball_rows(raw_csv, people_raw, ball_raw)
@@ -328,6 +473,27 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument('--max_gap', type=int, default=2)
 
     p.add_argument('--compare_3d', action='store_true', help='Create compare3d mp4')
+    p.add_argument('--raw_only', action='store_true', help='Skip fix/smooth postprocessing, output raw CSV only')
+
+    # Ball detection parameters (override hybrid_dual_final_patched.py globals)
+    p.add_argument('--conf_low_limit', type=float, default=0.03, help='Low confidence cutoff for YOLO inference')
+    p.add_argument('--conf_ball_low_limit', type=float, default=0.005, help='Low confidence cutoff for ball YOLO inference')
+    p.add_argument('--conf_ball', type=float, default=0.02, help='Minimum confidence to consider a ball detection')
+    p.add_argument('--ball_max_candidates', type=int, default=60, help='Max ball detections to keep per camera')
+    p.add_argument('--ball_reproj_thr', type=float, default=50.0, help='Reprojection error threshold in pixels')
+    p.add_argument('--ball_reproj_thr_loose', type=float, default=120.0, help='Loose reprojection error threshold (fallback)')
+    p.add_argument('--ball_max_jump_m', type=float, default=6.0, help='Max 3D jump distance for ball (meters)')
+    p.add_argument('--ball_max_jump_m_loose', type=float, default=12.0, help='Loose max 3D jump distance (fallback)')
+    p.add_argument('--ball_conf_weight', type=float, default=5.0, help='Weight for detection confidence in scoring')
+    p.add_argument('--ball_third_cam_weight', type=float, default=0.1, help='Weight for third camera reprojection error')
+    p.add_argument('--ball_gate_disable', action='store_true', help='Disable per-camera ball gating')
+    p.add_argument('--ball_gate_expand', type=float, default=2.0, help='Expand ratio for people-union bbox when gating balls')
+    p.add_argument('--ball_gate_cam3_right_cut', type=float, default=1.0, help='Cam3: drop balls with cx > W*cut (0-1). Set 1.0 to disable')
+    p.add_argument('--ball_gate_max_jump_px', type=float, default=800.0, help='Reject ball 2D jumps larger than this (px/frame)')
+    p.add_argument('--ball_gate_outside_focus_px', type=float, default=500.0, help='Drop balls far outside focus bbox (px)')
+    p.add_argument('--ball_reset_frames', type=int, default=30, help='Reset ball tracking after this many misses')
+    p.add_argument('--ball_fill_max_gap', type=int, default=30, help='Carry forward last ball for up to this many missing frames')
+    p.add_argument('--ball_verbose', action='store_true', help='Print ball debug info')
 
     return p
 
@@ -412,6 +578,26 @@ def main() -> None:
                     max_gap=args.max_gap,
                     compare_3d=bool(args.compare_3d),
                     log_path=log_path,
+                    raw_only=bool(args.raw_only),
+                    # Ball detection parameters
+                    conf_low_limit=args.conf_low_limit,
+                    conf_ball_low_limit=args.conf_ball_low_limit,
+                    conf_ball=args.conf_ball,
+                    ball_max_candidates=args.ball_max_candidates,
+                    ball_reproj_thr=args.ball_reproj_thr,
+                    ball_reproj_thr_loose=args.ball_reproj_thr_loose,
+                    ball_max_jump_m=args.ball_max_jump_m,
+                    ball_max_jump_m_loose=args.ball_max_jump_m_loose,
+                    ball_conf_weight=args.ball_conf_weight,
+                    ball_third_cam_weight=args.ball_third_cam_weight,
+                    ball_gate_enable=(not args.ball_gate_disable),
+                    ball_gate_expand=args.ball_gate_expand,
+                    ball_gate_cam3_right_cut=args.ball_gate_cam3_right_cut,
+                    ball_gate_max_jump_px=args.ball_gate_max_jump_px,
+                    ball_gate_outside_focus_px=args.ball_gate_outside_focus_px,
+                    ball_reset_frames=args.ball_reset_frames,
+                    ball_fill_max_gap=args.ball_fill_max_gap,
+                    ball_verbose=bool(args.ball_verbose),
                 )
                 ok += 1
             except Exception as e:
@@ -452,6 +638,26 @@ def main() -> None:
         max_gap=args.max_gap,
         compare_3d=bool(args.compare_3d),
         log_path=log_path,
+        raw_only=bool(args.raw_only),
+        # Ball detection parameters
+        conf_low_limit=args.conf_low_limit,
+        conf_ball_low_limit=args.conf_ball_low_limit,
+        conf_ball=args.conf_ball,
+        ball_max_candidates=args.ball_max_candidates,
+        ball_reproj_thr=args.ball_reproj_thr,
+        ball_reproj_thr_loose=args.ball_reproj_thr_loose,
+        ball_max_jump_m=args.ball_max_jump_m,
+        ball_max_jump_m_loose=args.ball_max_jump_m_loose,
+        ball_conf_weight=args.ball_conf_weight,
+        ball_third_cam_weight=args.ball_third_cam_weight,
+        ball_gate_enable=(not args.ball_gate_disable),
+        ball_gate_expand=args.ball_gate_expand,
+        ball_gate_cam3_right_cut=args.ball_gate_cam3_right_cut,
+        ball_gate_max_jump_px=args.ball_gate_max_jump_px,
+        ball_gate_outside_focus_px=args.ball_gate_outside_focus_px,
+        ball_reset_frames=args.ball_reset_frames,
+        ball_fill_max_gap=args.ball_fill_max_gap,
+        ball_verbose=bool(args.ball_verbose),
     )
 
 
