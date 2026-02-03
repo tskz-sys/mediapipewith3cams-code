@@ -141,6 +141,25 @@ PR本文テンプレ：
 
 ---
 
+## uv.lock 運用
+目的：依存解決の再現性を保つ。
+
+前提：ネットワークが必要。
+
+手順：
+1. 儀式（Developers手順）を実施
+2. ブランチ作成（例：`chore/add-uv-lock` / `chore/update-uv-lock`）
+3. `UV_CACHE_DIR=/tmp/uv_cache uv lock`
+4. `git status --porcelain` で `uv.lock` の変更有無を確認
+5. 変更が無い場合：PR不要。ブランチを削除
+6. 変更がある場合：コミット → PR → squash でマージ
+
+トラブル時の確認：
+1. `git check-ignore -v uv.lock`（無視対象になっていないか）
+2. `git ls-files uv.lock`（追跡されているか）
+
+---
+
 ## ローカルチェック（存在するものだけ実行）
 リポジトリに合わせて、あるものだけ走らせる（無ければスキップ）。
 ```bash
